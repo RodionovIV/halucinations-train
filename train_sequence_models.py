@@ -61,6 +61,11 @@ def parse_args():
     p.add_argument("--output",    default="results_sequence_models.csv")
     p.add_argument("--seed",      type=int,   default=42)
     p.add_argument("--device",    default="auto")
+    p.add_argument(
+        "--validate", default=None,
+        help="Optional path to a validation CSV. Models trained on the full "
+             "training set will be evaluated on it."
+    )
     return p.parse_args()
 
 
@@ -281,6 +286,63 @@ def train_eval_seq(
     return float(np.mean(fold_scores))
 
 
+def _val_predict_seq(
+    model_cls,
+    model_kwargs: dict,
+    X_train: np.ndarray,   # (N_tr, T, C)
+    y_train: np.ndarray,
+    X_val: np.ndarray,     # (N_val, T, C)
+    y_val: np.ndarray,
+    epochs: int, batch_size: int, lr: float,
+    seed: int, device: torch.device,
+) -> float:
+    """Train on full training data and return PR-AUC on the held-out val set."""
+    torch.manual_seed(seed)
+
+    # Normalise using full training data statistics
+    valid_mask_tr = (X_train.sum(-1) != 0)
+    flat = X_train[valid_mask_tr]
+    mean_ = flat.mean(0, keepdims=True).mean(0) if len(flat) else np.zeros(X_train.shape[-1])
+    std_  = flat.std(0,  keepdims=True).mean(0) if len(flat) else np.ones(X_train.shape[-1])
+    std_  = np.where(std_ < 1e-6, 1.0, std_)
+
+    X_tr_n  = (X_train - mean_) / std_
+    X_val_n = (X_val   - mean_) / std_
+
+    mask_tr  = torch.tensor((X_train.sum(-1) != 0), dtype=torch.bool,  device=device)
+    mask_val = torch.tensor((X_val.sum(-1)   != 0), dtype=torch.bool,  device=device)
+    X_tr_t   = torch.tensor(X_tr_n,  dtype=torch.float32, device=device)
+    X_val_t  = torch.tensor(X_val_n, dtype=torch.float32, device=device)
+    y_tr_t   = torch.tensor(y_train, dtype=torch.float32, device=device)
+
+    pos_weight = torch.tensor(
+        [(y_train == 0).sum() / max(1, (y_train == 1).sum())],
+        dtype=torch.float32, device=device,
+    )
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    in_channels = X_train.shape[-1]
+    model = model_cls(in_channels=in_channels, **model_kwargs).to(device)
+    opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=epochs, eta_min=lr * 0.05)
+
+    for _ in range(epochs):
+        model.train()
+        perm = torch.randperm(len(X_tr_t), device=device)
+        for i in range(0, len(X_tr_t), batch_size):
+            b    = perm[i : i + batch_size]
+            loss = criterion(model(X_tr_t[b], mask_tr[b]), y_tr_t[b])
+            opt.zero_grad(); loss.backward(); opt.step()
+        sched.step()
+
+    model.eval()
+    with torch.no_grad():
+        logits_val = model(X_val_t, mask_val).cpu().numpy()
+    proba_val = 1.0 / (1.0 + np.exp(-logits_val))
+    return float(average_precision_score(y_val, proba_val))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -296,6 +358,13 @@ def main():
 
     if args.label_col not in df.columns:
         sys.exit(f"ERROR: label column '{args.label_col}' not found.")
+
+    mask = df[args.label_col].isin([0, 1])
+    n_dropped = (~mask).sum()
+    if n_dropped:
+        print(f"[INFO] Dropping {n_dropped} rows with label not in {{0, 1}}")
+        df = df[mask].reset_index(drop=True)
+
     y = df[args.label_col].astype(int).values
 
     # Check whether any sequence columns are present
@@ -315,6 +384,25 @@ def main():
         f"| pos rate: {y.mean():.3%}"
     )
 
+    # Load validation dataset if provided
+    X_seqs_val, y_val_ext = None, None
+    if args.validate:
+        print(f"Loading validation set {args.validate} …")
+        df_val = pd.read_csv(args.validate)
+        if args.label_col not in df_val.columns:
+            sys.exit(f"ERROR: label column '{args.label_col}' not found in validation dataset.")
+        val_mask = df_val[args.label_col].isin([0, 1])
+        n_val_dropped = (~val_mask).sum()
+        if n_val_dropped:
+            print(f"[INFO] Validation: dropping {n_val_dropped} rows with label not in {{0, 1}}")
+            df_val = df_val[val_mask].reset_index(drop=True)
+        y_val_ext = df_val[args.label_col].astype(int).values
+        X_seqs_val = load_token_sequences(df_val, args.max_len)
+        print(
+            f"Validation sequences shape: {X_seqs_val.shape} "
+            f"| pos rate: {y_val_ext.mean():.3%}"
+        )
+
     models_to_run = [
         ("Conv1D_64",    Conv1DClassifier, {"hidden": 64}),
         ("Conv1D_128",   Conv1DClassifier, {"hidden": 128}),
@@ -332,13 +420,23 @@ def main():
             epochs=args.epochs, batch_size=args.batch, lr=args.lr,
             n_splits=args.n_splits, seed=args.seed, device=device,
         )
-        print(f"  {model_name:<30}  PR-AUC={pr_auc:.4f}")
-        results.append({
+        val_suffix = ""
+        row = {
             "model":      model_name,
             "n_channels": C,
             "max_len":    args.max_len,
             "pr_auc":     round(pr_auc, 5),
-        })
+        }
+        if X_seqs_val is not None:
+            val_pr = _val_predict_seq(
+                model_cls, model_kwargs, X_seqs, y, X_seqs_val, y_val_ext,
+                epochs=args.epochs, batch_size=args.batch, lr=args.lr,
+                seed=args.seed, device=device,
+            )
+            val_suffix = f"   [val] PR-AUC={val_pr:.4f}"
+            row["val_pr_auc"] = round(val_pr, 5)
+        print(f"  {model_name:<30}  PR-AUC={pr_auc:.4f}{val_suffix}")
+        results.append(row)
 
     df_res = (
         pd.DataFrame(results)

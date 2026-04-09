@@ -38,7 +38,6 @@ from sklearn.preprocessing import StandardScaler
 
 from features import (
     ALL_LAYER_FEATURES,
-    FEATURE_SETS,
     HIDDEN_FIRST,
     HIDDEN_LAST,
     LAYERDIFF_FIRST,
@@ -55,29 +54,41 @@ warnings.filterwarnings("ignore")
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="MHAD-style MLP probes for hallucination detection."
     )
-    p.add_argument("--data",      default="final_features.csv")
+    p.add_argument("--data", default="final_features.csv")
     p.add_argument("--label_col", default="label")
-    p.add_argument("--n_splits",  type=int, default=5)
-    p.add_argument("--epochs",    type=int, default=50,
-                   help="Training epochs per fold per config")
-    p.add_argument("--batch",     type=int, default=256)
-    p.add_argument("--lr",        type=float, default=1e-3)
-    p.add_argument("--top_k_neurons", type=int, default=32,
-                   help="Keep top-k features after linear-probe neuron selection")
-    p.add_argument("--output",    default="results_mhad_mlp.csv")
-    p.add_argument("--seed",      type=int, default=42)
-    p.add_argument("--device",    default="auto",
-                   help="'cpu', 'cuda', 'mps', or 'auto'")
+    p.add_argument("--n_splits", type=int, default=5)
+    p.add_argument(
+        "--epochs", type=int, default=50, help="Training epochs per fold per config"
+    )
+    p.add_argument("--batch", type=int, default=256)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument(
+        "--top_k_neurons",
+        type=int,
+        default=32,
+        help="Keep top-k features after linear-probe neuron selection",
+    )
+    p.add_argument("--output", default="results_mhad_mlp.csv")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", default="auto", help="'cpu', 'cuda', 'mps', or 'auto'")
+    p.add_argument(
+        "--validate",
+        default=None,
+        help="Optional path to a validation CSV. Models trained on the full "
+        "training set will be evaluated on it.",
+    )
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Device selection
 # ---------------------------------------------------------------------------
+
 
 def get_device(preference: str) -> torch.device:
     if preference == "auto":
@@ -93,17 +104,21 @@ def get_device(preference: str) -> torch.device:
 # MLP architectures
 # ---------------------------------------------------------------------------
 
+
 class MLP(nn.Module):
     """Small MLP as used in MHAD."""
 
-    def __init__(self, input_dim: int, hidden_dims: list[int],
-                 dropout: float = 0.3):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float = 0.3):
         super().__init__()
         dims = [input_dim] + hidden_dims
         layers = []
         for a, b in zip(dims[:-1], dims[1:]):
-            layers += [nn.Linear(a, b), nn.BatchNorm1d(b), nn.ReLU(),
-                       nn.Dropout(dropout)]
+            layers += [
+                nn.Linear(a, b),
+                nn.BatchNorm1d(b),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ]
         layers.append(nn.Linear(dims[-1], 1))
         self.net = nn.Sequential(*layers)
 
@@ -115,8 +130,10 @@ class MLP(nn.Module):
 # Neuron selection  (MHAD Step-1 adaptation)
 # ---------------------------------------------------------------------------
 
-def select_top_k_features(X: np.ndarray, y: np.ndarray,
-                           top_k: int, seed: int) -> np.ndarray:
+
+def select_top_k_features(
+    X: np.ndarray, y: np.ndarray, top_k: int, seed: int
+) -> np.ndarray:
     """
     Rank features by |coef| from a logistic regression trained on the full data
     (simulates MHAD's linear-probe neuron importance ranking).
@@ -128,8 +145,11 @@ def select_top_k_features(X: np.ndarray, y: np.ndarray,
     X_sc = scl.transform(X_imp)
 
     lr = LogisticRegression(
-        max_iter=500, C=1.0, solver="lbfgs",
-        class_weight="balanced", random_state=seed,
+        max_iter=500,
+        C=1.0,
+        solver="lbfgs",
+        class_weight="balanced",
+        random_state=seed,
     )
     lr.fit(X_sc, y)
     importance = np.abs(lr.coef_[0])
@@ -140,12 +160,18 @@ def select_top_k_features(X: np.ndarray, y: np.ndarray,
 # Training loop
 # ---------------------------------------------------------------------------
 
+
 def train_eval_mlp(
-    X: np.ndarray, y: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
     hidden_dims: list[int],
     dropout: float,
-    epochs: int, batch_size: int, lr: float,
-    n_splits: int, seed: int, device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    n_splits: int,
+    seed: int,
+    device: torch.device,
 ) -> float:
     """Stratified-CV training; returns mean PR-AUC."""
 
@@ -165,15 +191,16 @@ def train_eval_mlp(
         imp = SimpleImputer(strategy="median").fit(X_tr)
         scl = StandardScaler().fit(imp.transform(X_tr))
 
-        X_tr_t  = torch.tensor(scl.transform(imp.transform(X_tr)),
-                               dtype=torch.float32, device=device)
-        X_val_t = torch.tensor(scl.transform(imp.transform(X_val)),
-                               dtype=torch.float32, device=device)
-        y_tr_t  = torch.tensor(y_tr, dtype=torch.float32, device=device)
+        X_tr_t = torch.tensor(
+            scl.transform(imp.transform(X_tr)), dtype=torch.float32, device=device
+        )
+        X_val_t = torch.tensor(
+            scl.transform(imp.transform(X_val)), dtype=torch.float32, device=device
+        )
+        y_tr_t = torch.tensor(y_tr, dtype=torch.float32, device=device)
 
         model = MLP(X.shape[1], hidden_dims, dropout).to(device)
-        optimiser = torch.optim.Adam(model.parameters(), lr=lr,
-                                     weight_decay=1e-4)
+        optimiser = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimiser, T_max=epochs, eta_min=lr * 0.1
         )
@@ -185,7 +212,7 @@ def train_eval_mlp(
             for i in range(0, len(X_tr_t), batch_size):
                 idx_b = perm[i : i + batch_size]
                 logits = model(X_tr_t[idx_b])
-                loss   = criterion(logits, y_tr_t[idx_b])
+                loss = criterion(logits, y_tr_t[idx_b])
                 optimiser.zero_grad()
                 loss.backward()
                 optimiser.step()
@@ -195,19 +222,77 @@ def train_eval_mlp(
         model.eval()
         with torch.no_grad():
             logits_val = model(X_val_t).cpu().numpy()
-        proba_val = 1.0 / (1.0 + np.exp(-logits_val))   # sigmoid
+        proba_val = 1.0 / (1.0 + np.exp(-logits_val))  # sigmoid
         score = average_precision_score(y_val, proba_val)
         fold_scores.append(score)
 
     return float(np.mean(fold_scores))
 
 
+def _val_predict_mlp(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    hidden_dims: list[int],
+    dropout: float,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    seed: int,
+    device: torch.device,
+) -> float:
+    """Train on full training data and return PR-AUC on the held-out val set."""
+    torch.manual_seed(seed)
+    imp = SimpleImputer(strategy="median").fit(X_train)
+    scl = StandardScaler().fit(imp.transform(X_train))
+
+    X_tr_t = torch.tensor(
+        scl.transform(imp.transform(X_train)), dtype=torch.float32, device=device
+    )
+    X_val_t = torch.tensor(
+        scl.transform(imp.transform(X_val)), dtype=torch.float32, device=device
+    )
+    y_tr_t = torch.tensor(y_train, dtype=torch.float32, device=device)
+
+    pos_weight = torch.tensor(
+        [(y_train == 0).sum() / max(1, (y_train == 1).sum())],
+        dtype=torch.float32,
+        device=device,
+    )
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    model = MLP(X_train.shape[1], hidden_dims, dropout).to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimiser, T_max=epochs, eta_min=lr * 0.1
+    )
+
+    for _ in range(epochs):
+        model.train()
+        perm = torch.randperm(len(X_tr_t), device=device)
+        for i in range(0, len(X_tr_t), batch_size):
+            idx_b = perm[i : i + batch_size]
+            loss = criterion(model(X_tr_t[idx_b]), y_tr_t[idx_b])
+            optimiser.zero_grad()
+            loss.backward()
+            optimiser.step()
+        scheduler.step()
+
+    model.eval()
+    with torch.no_grad():
+        logits_val = model(X_val_t).cpu().numpy()
+    proba_val = 1.0 / (1.0 + np.exp(-logits_val))
+    return float(average_precision_score(y_val, proba_val))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    args   = parse_args()
+    args = parse_args()
     device = get_device(args.device)
     print(f"Device: {device}")
 
@@ -219,34 +304,66 @@ def main():
 
     if args.label_col not in df.columns:
         sys.exit(f"ERROR: label column '{args.label_col}' not found.")
+
+    mask = df[args.label_col].isin([0, 1])
+    n_dropped = (~mask).sum()
+    if n_dropped:
+        print(f"[INFO] Dropping {n_dropped} rows with label not in {{0, 1}}")
+        df = df[mask].reset_index(drop=True)
+
     y = df[args.label_col].astype(int).values
 
-    print(
-        f"Dataset: {len(df):,} samples | "
-        f"positive rate: {y.mean():.3%}"
-    )
+    print(f"Dataset: {len(df):,} samples | positive rate: {y.mean():.3%}")
+
+    # Load validation dataset if provided
+    df_val, y_val = None, None
+    if args.validate:
+        print(f"Loading validation set {args.validate} …")
+        df_val = pd.read_csv(args.validate)
+        if args.label_col not in df_val.columns:
+            sys.exit(
+                f"ERROR: label column '{args.label_col}' not found in validation dataset."
+            )
+        val_mask = df_val[args.label_col].isin([0, 1])
+        n_val_dropped = (~val_mask).sum()
+        if n_val_dropped:
+            print(
+                f"[INFO] Validation: dropping {n_val_dropped} rows with label not in {{0, 1}}"
+            )
+            df_val = df_val[val_mask].reset_index(drop=True)
+        y_val = df_val[args.label_col].astype(int).values
+        print(
+            f"Validation: {len(df_val):,} samples | positive rate: {y_val.mean():.3%}"
+        )
 
     # -----------------------------------------------------------------------
     # Feature-set definitions  (mirroring MHAD architecture intent)
     # -----------------------------------------------------------------------
     feature_sets_mhad = {
         # Core MHAD: first-token + last-token hidden states (the "awareness vector")
-        "mhad_first+last":      HIDDEN_FIRST + HIDDEN_LAST + LAYERDIFF_FIRST + LAYERDIFF_LAST,
+        "mhad_first+last": HIDDEN_FIRST
+        + HIDDEN_LAST
+        + LAYERDIFF_FIRST
+        + LAYERDIFF_LAST,
         # MHAD + logprob uncertainty (our dataset's rich uncertainty side)
-        "mhad_full":            HIDDEN_FIRST + HIDDEN_LAST + LAYERDIFF_FIRST + LAYERDIFF_LAST
-                                + UNCERTAINTY_FEATURES + META_FEATURES,
+        "mhad_full": HIDDEN_FIRST
+        + HIDDEN_LAST
+        + LAYERDIFF_FIRST
+        + LAYERDIFF_LAST
+        + UNCERTAINTY_FEATURES
+        + META_FEATURES,
         # All layer features (comprehensive)
-        "sep_all_layers":       ALL_LAYER_FEATURES,
+        "sep_all_layers": ALL_LAYER_FEATURES,
         # Combined everything
-        "all_features":         ALL_LAYER_FEATURES + UNCERTAINTY_FEATURES + META_FEATURES,
+        "all_features": ALL_LAYER_FEATURES + UNCERTAINTY_FEATURES + META_FEATURES,
     }
 
     # Architecture sweep
     arch_variants = {
-        "shallow_32":     ([32], 0.2),
-        "medium_128_64":  ([128, 64], 0.3),
-        "deep_256_128_64":([256, 128, 64], 0.3),
-        "wide_512_256":   ([512, 256], 0.4),
+        "shallow_32": ([32], 0.2),
+        "medium_128_64": ([128, 64], 0.3),
+        "deep_256_128_64": ([256, 128, 64], 0.3),
+        "wide_512_256": ([512, 256], 0.4),
     }
 
     results = []
@@ -259,23 +376,24 @@ def main():
 
         X_full = df[avail].values.astype(np.float32)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Feature set: {feat_name}  ({len(avail)} features)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # ---- MHAD Step-1: top-k neuron selection ----------------------------
         top_k = min(args.top_k_neurons, X_full.shape[1])
         top_idx = select_top_k_features(X_full, y, top_k, args.seed)
-        X_topk  = X_full[:, top_idx]
+        X_topk = X_full[:, top_idx]
 
         for arch_name, (hidden_dims, dropout) in arch_variants.items():
             for use_topk, X_in, suffix in [
-                (False, X_full,  ""),
-                (True,  X_topk, f"_top{top_k}"),
+                (False, X_full, ""),
+                (True, X_topk, f"_top{top_k}"),
             ]:
                 config_name = f"{feat_name} | {arch_name}{suffix}"
                 pr_auc = train_eval_mlp(
-                    X_in, y,
+                    X_in,
+                    y,
                     hidden_dims=hidden_dims,
                     dropout=dropout,
                     epochs=args.epochs,
@@ -285,16 +403,36 @@ def main():
                     seed=args.seed,
                     device=device,
                 )
-                print(
-                    f"  {arch_name}{suffix:<12}  "
-                    f"PR-AUC={pr_auc:.4f}"
-                )
-                results.append({
-                    "feature_set":  feat_name,
+                val_suffix = ""
+                row = {
+                    "feature_set": feat_name,
                     "architecture": arch_name + suffix,
-                    "n_features":   X_in.shape[1],
-                    "pr_auc":       round(pr_auc, 5),
-                })
+                    "n_features": X_in.shape[1],
+                    "pr_auc": round(pr_auc, 5),
+                }
+                if df_val is not None:
+                    avail_val = available_cols(feat_cols, df_val.columns)
+                    if avail_val:
+                        X_val_in = df_val[avail_val].values.astype(np.float32)
+                        if use_topk:
+                            X_val_in = X_val_in[:, top_idx]
+                        val_pr = _val_predict_mlp(
+                            X_in,
+                            y,
+                            X_val_in,
+                            y_val,
+                            hidden_dims=hidden_dims,
+                            dropout=dropout,
+                            epochs=args.epochs,
+                            batch_size=args.batch,
+                            lr=args.lr,
+                            seed=args.seed,
+                            device=device,
+                        )
+                        val_suffix = f"   [val] PR-AUC={val_pr:.4f}"
+                        row["val_pr_auc"] = round(val_pr, 5)
+                print(f"  {arch_name}{suffix:<12}  PR-AUC={pr_auc:.4f}{val_suffix}")
+                results.append(row)
 
     df_res = (
         pd.DataFrame(results)

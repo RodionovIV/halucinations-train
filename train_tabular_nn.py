@@ -57,6 +57,11 @@ def parse_args():
         "--feature_set", default="all_features",
         help=f"Feature set key from features.py. Choices: {list(FEATURE_SETS.keys())}",
     )
+    p.add_argument(
+        "--validate", default=None,
+        help="Optional path to a validation CSV. Models trained on the full "
+             "training set will be evaluated on it."
+    )
     return p.parse_args()
 
 
@@ -247,6 +252,57 @@ def train_eval(
     return float(np.mean(fold_scores))
 
 
+def _val_predict(
+    model_cls,
+    model_kwargs: dict,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    seed: int,
+    device: torch.device,
+) -> float:
+    """Train on full training data and return PR-AUC on the held-out val set."""
+    torch.manual_seed(seed)
+    imp = SimpleImputer(strategy="median").fit(X_train)
+    scl = StandardScaler().fit(imp.transform(X_train))
+
+    X_tr_t  = torch.tensor(scl.transform(imp.transform(X_train)),
+                           dtype=torch.float32, device=device)
+    X_val_t = torch.tensor(scl.transform(imp.transform(X_val)),
+                           dtype=torch.float32, device=device)
+    y_tr_t  = torch.tensor(y_train, dtype=torch.float32, device=device)
+
+    pos_weight = torch.tensor(
+        [(y_train == 0).sum() / max(1, (y_train == 1).sum())],
+        dtype=torch.float32, device=device,
+    )
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    model = model_cls(input_dim=X_train.shape[1], **model_kwargs).to(device)
+    opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=epochs, eta_min=lr * 0.05)
+
+    for _ in range(epochs):
+        model.train()
+        perm = torch.randperm(len(X_tr_t), device=device)
+        for i in range(0, len(X_tr_t), batch_size):
+            b    = perm[i : i + batch_size]
+            loss = criterion(model(X_tr_t[b]), y_tr_t[b])
+            opt.zero_grad(); loss.backward(); opt.step()
+        sched.step()
+
+    model.eval()
+    with torch.no_grad():
+        logits_val = model(X_val_t).cpu().numpy()
+    proba_val = 1.0 / (1.0 + np.exp(-logits_val))
+    return float(average_precision_score(y_val, proba_val))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -262,6 +318,13 @@ def main():
 
     if args.label_col not in df.columns:
         sys.exit(f"ERROR: label column '{args.label_col}' not found.")
+
+    mask = df[args.label_col].isin([0, 1])
+    n_dropped = (~mask).sum()
+    if n_dropped:
+        print(f"[INFO] Dropping {n_dropped} rows with label not in {{0, 1}}")
+        df = df[mask].reset_index(drop=True)
+
     y = df[args.label_col].astype(int).values
 
     if args.feature_set not in FEATURE_SETS:
@@ -276,6 +339,26 @@ def main():
         f"Feature set  : {args.feature_set}  ({len(avail)} features)\n"
         f"Dataset      : {len(df):,} samples | pos rate {y.mean():.3%}"
     )
+
+    # Load validation dataset if provided
+    X_val_ext, y_val_ext = None, None
+    if args.validate:
+        print(f"Loading validation set {args.validate} …")
+        df_val = pd.read_csv(args.validate)
+        if args.label_col not in df_val.columns:
+            sys.exit(f"ERROR: label column '{args.label_col}' not found in validation dataset.")
+        val_mask = df_val[args.label_col].isin([0, 1])
+        n_val_dropped = (~val_mask).sum()
+        if n_val_dropped:
+            print(f"[INFO] Validation: dropping {n_val_dropped} rows with label not in {{0, 1}}")
+            df_val = df_val[val_mask].reset_index(drop=True)
+        y_val_ext = df_val[args.label_col].astype(int).values
+        avail_val = available_cols(feat_cols, df_val.columns)
+        if avail_val:
+            X_val_ext = df_val[avail_val].values.astype(np.float32)
+        print(
+            f"Validation: {len(df_val):,} samples | positive rate: {y_val_ext.mean():.3%}"
+        )
 
     # ---- Model catalogue --------------------------------------------------
     # Limit TabTransformer / AutoInt feature dim to avoid GPU OOM
@@ -308,13 +391,23 @@ def main():
             epochs=args.epochs, batch_size=args.batch, lr=args.lr,
             n_splits=args.n_splits, seed=args.seed, device=device,
         )
-        print(f"  {model_name:<30}  PR-AUC={pr_auc:.4f}")
-        results.append({
+        val_suffix = ""
+        row = {
             "model":        model_name,
             "feature_set":  args.feature_set,
             "n_features":   len(avail),
             "pr_auc":       round(pr_auc, 5),
-        })
+        }
+        if X_val_ext is not None:
+            val_pr = _val_predict(
+                model_cls, model_kwargs, X, y, X_val_ext, y_val_ext,
+                epochs=args.epochs, batch_size=args.batch, lr=args.lr,
+                seed=args.seed, device=device,
+            )
+            val_suffix = f"   [val] PR-AUC={val_pr:.4f}"
+            row["val_pr_auc"] = round(val_pr, 5)
+        print(f"  {model_name:<30}  PR-AUC={pr_auc:.4f}{val_suffix}")
+        results.append(row)
 
     df_res = (
         pd.DataFrame(results)
